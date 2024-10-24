@@ -21,7 +21,7 @@ You are also required to install the following packages:
 - [cocoapi](https://github.com/cocodataset/cocoapi)
 
 
-We test our models under ```python=3.8, pytorch=1.11.0, cuda=10.1```, 8 Nvidia V100 32GB GPUs.
+We test our models under ```python=3.8, pytorch=1.11.0, cuda=10.1```
 
 ## Data
 Please refer to [dataset_prepare.md](dataset_prep.md).
