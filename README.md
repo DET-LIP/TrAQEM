@@ -24,15 +24,12 @@ You are also required to install the following packages:
 We test our models under ```python=3.8, pytorch=1.11.0, cuda=10.1```, 8 Nvidia V100 32GB GPUs.
 
 ## Data
-Please refer to [dataset_prepare.md](./dataset_prepare.md).
+Please refer to [dataset_prepare.md](dataset_prep.md).
 
 
-## Model Zoo
-- Open-vocabulary COCO (AP50 metric)
+## Results
 
-| Base | Novel| All | Model |
-|------|------|-----|-------|
-| 61.0 | 29.4 | 52.7|[Google Drive](https://drive.google.com/file/d/1_iypFgVsLQwXVrT5zDtKeFaxOcC_A3uO/view?usp=sharing)|
+
 
 ## Citation
 If you find our work useful for your research, please consider citing the paper:
