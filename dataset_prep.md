@@ -1,4 +1,4 @@
-## Open-Vocabulary COCO
+## Open-Vocabulary COCO/Cityscapes/VisDrone/UAVDT
 
 1. Download the [COCO](https://cocodataset.org/#home) dataset.
 
@@ -6,6 +6,3 @@
 
 3. Extract the CLIP image features. You can download our pre-generated file in [Google Drive](https://drive.google.com/file/d/1nZJcr0Rl1Osy6qxbNPd1eIgZiZ0Warc6/view?usp=sharing), or use the [script](scripts/save_clip_features.py) to extract it by yourself.
 
-## Open-Vocabulary LVIS
-
-Under preparation.
