@@ -69,7 +69,7 @@ class DeformableDETR(nn.Module):
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
         
-        # Memory bank for storing visual features
+        # Memory bank for storing text and visual features
         self.memory_bank = MemoryBank(memory_size=memory_size, feature_dim=feature_dim)
 
         # Initialize category-specific queries
@@ -170,26 +170,25 @@ class DeformableDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        # Only use visual embeddings in the memory bank
-        uniq_labels = torch.cat([t["labels"] for t in targets]) if targets else torch.tensor([])
-        uniq_labels = torch.unique(uniq_labels) if len(uniq_labels) > 0 else torch.tensor([])
-
-        # Update the memory bank with visual features from the current frame
-        for i, label in enumerate(uniq_labels):
-            visual_features = self.extract_visual_features(features)  # Extract visual features
-            self.memory_bank.add(label.item(), visual_features)
-
-        # Refine the selected category queries based on memory bank
-        selected_queries = self.category_query_embed(uniq_labels) if len(uniq_labels) > 0 else None
-        if selected_queries is not None:
+        # Determine which categories are present in the targets
+        if targets is not None:
+            uniq_labels = torch.cat([t["labels"] for t in targets])
+            uniq_labels = torch.unique(uniq_labels)
+            # Select corresponding category-specific queries
+            selected_queries = self.category_query_embed(uniq_labels)
+            # Retrieve memory bank features for the selected categories
             memory_features = [self.memory_bank.get_memory(label.item()) for label in uniq_labels]
-            memory_features = torch.stack(memory_features).mean(dim=0) if len(memory_features) > 0 else None
+            memory_features = torch.stack(memory_features) if len(memory_features) > 0 else None
+
+            # Refine the selected queries using memory bank information
             if memory_features is not None:
-                selected_queries = selected_queries + memory_features
+                selected_queries = selected_queries + memory_features.mean(dim=0)
 
-        refined_queries = self.query_refinement_layer(selected_queries) if selected_queries is not None else None
+            # Optionally refine the queries further
+            refined_queries = self.query_refinement_layer(selected_queries)
+        else:
+            refined_queries = self.query_embed.weight  # use default queries if no targets
 
-        # Pass the refined queries through the transformer
         (
             hs,
             init_reference,
@@ -198,7 +197,6 @@ class DeformableDETR(nn.Module):
             enc_outputs_coord_unact,
         ), _ = self.transformer(srcs, masks, pos, refined_queries)
 
-        # Calculate outputs
         outputs_classes = []
         outputs_coords = []
         for lvl in range(hs.shape[0]):
@@ -235,16 +233,6 @@ class DeformableDETR(nn.Module):
             for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
         ]
 
-    def extract_visual_features(self, features):
-        """
-        Custom method to extract visual features from samples using the model backbone.
-        This method aggregates visual features across multiple levels.
-        """
-        # Example approach: Take average feature vectors across spatial dimensions from the last level
-        last_level_features = features[-1].tensors
-        visual_features = last_level_features.mean(dim=[-2, -1])  # Mean pooling across spatial dimensions
-        return visual_features
-
 class OVDETR(DeformableDETR):
     def __init__(
         self,
@@ -256,14 +244,14 @@ class OVDETR(DeformableDETR):
         aux_loss=True,
         with_box_refine=False,
         two_stage=False,
-        cls_out_channels=1,
+        cls_out_channels=2,
         dataset_file="coco",
         zeroshot_w=None,
         max_len=15,
         clip_feat_path=None,
         prob=0.5,
         memory_size=100,
-        feature_dim=512,
+        feature_dim=512
     ):
         super().__init__(
             backbone,
@@ -274,9 +262,249 @@ class OVDETR(DeformableDETR):
             aux_loss,
             with_box_refine,
             two_stage,
-            cls_out_channels,
-            memory_size,
-            feature_dim
+            cls_out_channels=1,
+            memory_size=memory_size,
+            feature_dim=feature_dim
         )
         self.zeroshot_w = zeroshot_w.t()
+
+        self.patch2query = nn.Linear(512, 256)
+        self.patch2query_img = nn.Linear(512, 256)
+        for layer in [self.patch2query]:
+            nn.init.xavier_uniform_(self.patch2query.weight)
+            nn.init.constant_(self.patch2query.bias, 0)
+
+        self.feature_align = nn.Linear(256, 512)
+        nn.init.xavier_uniform_(self.feature_align.weight)
+        nn.init.constant_(self.feature_align.bias, 0)
+
+        num_pred = transformer.decoder.num_layers
+        if with_box_refine:
+            self.feature_align = _get_clones(self.feature_align, num_pred)
+        else:
+            self.feature_align = nn.ModuleList([self.feature_align for _ in range(num_pred)])
+
+        self.all_ids = torch.tensor(range(self.zeroshot_w.shape[-1]))
+        self.max_len = max_len
+        self.max_pad_len = max_len - 3
+
+        self.clip_feat = torch.load(clip_feat_path)
         self.prob = prob
+
+    def forward(self, samples: NestedTensor, targets=None):
+        if self.training:
+            return self.forward_train(samples, targets)
+        else:
+            return self.forward_test(samples)
+
+    def forward_train(self, samples: NestedTensor, targets=None):
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                pos.append(pos_l)
+
+        uniq_labels = torch.cat([t["labels"] for t in targets])
+        uniq_labels = torch.unique(uniq_labels).to("cpu")
+        uniq_labels = uniq_labels[torch.randperm(len(uniq_labels))][: self.max_len]
+        select_id = uniq_labels.tolist()
+        if len(select_id) < self.max_pad_len:
+            pad_len = self.max_pad_len - len(uniq_labels)
+            extra_list = torch.tensor([i for i in self.all_ids if i not in uniq_labels])
+            extra_labels = extra_list[torch.randperm(len(extra_list))][:pad_len]
+            select_id += extra_labels.tolist()
+
+        text_query = self.zeroshot_w[:, select_id].t()
+        img_query = []
+        for cat_id in select_id:
+            if cat_id in self.clip_feat:
+                index = torch.randperm(len(self.clip_feat[cat_id]))[0:1]
+                img_query.append(self.clip_feat[cat_id][index])
+            else:
+                # Use a random embedding for unseen categories
+                random_embedding = torch.randn(1, 512).to(text_query.device)
+                img_query.append(random_embedding)
+
+        img_query = torch.cat(img_query).to(text_query.device)
+        img_query = img_query / img_query.norm(dim=-1, keepdim=True)
+
+        mask = (torch.rand(len(text_query)) < self.prob).float().unsqueeze(1).to(text_query.device)
+        clip_query_ori = (text_query * mask + img_query * (1 - mask)).detach()
+
+        dtype = self.patch2query.weight.dtype
+        text_query = self.patch2query(text_query.type(dtype))
+        img_query = self.patch2query_img(img_query.type(dtype))
+        clip_query = text_query * mask + img_query * (1 - mask)
+
+        # Update the memory bank with the text and visual features
+        for i, cat_id in enumerate(select_id):
+            self.memory_bank.add(cat_id, clip_query[i])
+
+        query_embeds = None
+        if not self.two_stage:
+            query_embeds = self.query_embed.weight
+        (
+            hs,
+            init_reference,
+            inter_references,
+            enc_outputs_class,
+            enc_outputs_coord_unact,
+            _,
+        ), _ = self.transformer(srcs, masks, pos, query_embeds, text_query=clip_query)
+
+        outputs_classes = []
+        outputs_coords = []
+        outputs_embeds = []
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.get_outputs_class(self.class_embed[lvl], hs[lvl])
+            tmp = self.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            outputs_classes.append(outputs_class)
+            outputs_coords.append(outputs_coord)
+            outputs_embeds.append(self.feature_align[lvl](hs[lvl]))
+
+        outputs_class = torch.stack(outputs_classes)
+        outputs_coord = torch.stack(outputs_coords)
+        outputs_embed = torch.stack(outputs_embeds)
+        out = {
+            "pred_logits": outputs_class[-1],
+            "pred_boxes": outputs_coord[-1],
+            "pred_embed": outputs_embed[-1],
+            "select_id": select_id,
+            "clip_query": clip_query_ori,
+        }
+        if self.aux_loss:
+            out["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+            for temp, embed in zip(out["aux_outputs"], outputs_embed[:-1]):
+                temp["select_id"] = select_id
+                temp["pred_embed"] = embed
+                temp["clip_query"] = clip_query_ori
+
+        if self.two_stage:
+            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+            out["enc_outputs"] = {
+                "pred_logits": enc_outputs_class,
+                "pred_boxes": enc_outputs_coord,
+                "select_id": select_id,
+            }
+        return out
+
+    def forward_test(self, samples: NestedTensor):
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                pos.append(pos_l)
+
+        select_id = list(range(self.zeroshot_w.shape[-1]))
+        query_embeds = None
+        if not self.two_stage:
+            query_embeds = self.query_embed.weight
+
+        outputs_class_list = []
+        outputs_coord_list = []
+        num_patch = 15
+        cache = None
+        dtype = self.patch2query.weight.dtype
+        for c in range(len(select_id) // num_patch + 1):
+            clip_query = self.zeroshot_w[:, c * num_patch : (c + 1) * num_patch].t()
+            clip_query = self.patch2query(clip_query.type(dtype))
+            (
+                hs,
+                init_reference,
+                inter_references,
+                enc_outputs_class,
+                enc_outputs_coord_unact,
+                cache,
+            ), _ = self.transformer(
+                srcs, masks, pos, query_embeds, text_query=clip_query, cache=cache
+            )
+
+            outputs_classes = []
+            outputs_coords = []
+            for lvl in range(hs.shape[0]):
+                if lvl == 0:
+                    reference = init_reference
+                else:
+                    reference = inter_references[lvl - 1]
+                reference = inverse_sigmoid(reference)
+                outputs_class = self.get_outputs_class(self.class_embed[lvl], hs[lvl])
+                tmp = self.bbox_embed[lvl](hs[lvl])
+                if reference.shape[-1] == 4:
+                    tmp += reference
+                else:
+                    assert reference.shape[-1] == 2
+                    tmp[..., :2] += reference
+                outputs_coord = tmp.sigmoid()
+                outputs_classes.append(outputs_class)
+                outputs_coords.append(outputs_coord)
+            outputs_class = torch.stack(outputs_classes)
+            outputs_coord = torch.stack(outputs_coords)
+            outputs_class_list.append(outputs_class)
+            outputs_coord_list.append(outputs_coord)
+        outputs_class = torch.cat(outputs_class_list, -2)
+        outputs_coord = torch.cat(outputs_coord_list, -2)
+
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
+        out["select_id"] = select_id
+        if self.aux_loss:
+            out["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+            for temp in out["aux_outputs"]:
+                temp["select_id"] = select_id
+
+        if self.two_stage:
+            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+            out["enc_outputs"] = {
+                "pred_logits": enc_outputs_class,
+                "pred_boxes": enc_outputs_coord,
+                "select_id": select_id, 
+            }
+        return out
