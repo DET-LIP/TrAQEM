@@ -9,7 +9,7 @@ This repository contains the implementation of the following paper:
 
   
 <p align="center">
-  <img width=95% src="images/images/model.png">
+  <img width=95% src="model.png">
 </p>
 
 ## Installation
