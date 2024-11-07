@@ -1,4 +1,4 @@
-<h1 align="center"> DET-LIP </h1>
+<h1 align="center"> TrAQEM</h1>
 
 <h2 align="center">
 
